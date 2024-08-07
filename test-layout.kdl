@@ -1,0 +1,18 @@
+layout {
+    pane size=1 borderless=true {
+        plugin location="zellij:tab-bar"
+    }
+    pane {
+        plugin location="file:/home/aram/code/rust-plugin-example/target/wasm32-wasi/debug/rust-plugin-example.wasm" {
+            commands {
+                "curl https://get.volta.sh | bash";
+                "volta install pnpm";
+                "pnpm install";
+                "docker-compose up -d";
+            }
+        }
+    }
+    pane size=1 borderless=true {
+        plugin location="zellij:status-bar"
+    }
+}
