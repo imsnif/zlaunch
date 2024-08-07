@@ -19,6 +19,7 @@ struct State {
     selected_index: Option<usize>,
     paused: bool,
     stop_on_failure: bool,
+    panes_to_run_on_completion: HashMap<String, Option<PaneId>>,
 }
 
 register_plugin!(State);
@@ -67,10 +68,10 @@ impl ZellijPlugin for State {
             EventType::Key,
             EventType::Timer,
             EventType::PaneClosed,
+            EventType::PaneUpdate,
         ]);
 
         let mut commands_to_run = vec![];
-        eprintln!("userspace_configuration: {:?}", self.userspace_configuration);
         if let Some(commands) = self.userspace_configuration.get("commands") {
             if let Ok(doc) = commands.parse::<KdlDocument>() {
                 // commands are in kdl format
@@ -83,30 +84,18 @@ impl ZellijPlugin for State {
                 }
             }
         }
+        if let Some(commands) = self.userspace_configuration.get("panes_to_run_on_completion") {
+            if let Ok(doc) = commands.parse::<KdlDocument>() {
+                // these are in kdl format
+                for node in doc.nodes() {
+                    self.panes_to_run_on_completion.insert(node.name().value().trim().to_owned(), None);
+                }
+            }
+        }
 
         self.shell = self.userspace_configuration.get("shell").map(|s| s.to_string()).unwrap_or_else(|| "bash".to_string());
         self.folder = self.userspace_configuration.get("folder").map(|s| s.to_string()).unwrap_or_else(|| ".".to_string());
 
-        // TODO:
-        // * cleanups (close terminals on re-run... anything else?) - DONE
-        // * if terminal is closed, re-run the command when pressing TAB - DONE
-        // * allow to stop after failed command with config or smth - DONE
-        // * allow to pause run - DONE
-        // * "re-run from here" - Not now
-        // * receive commands from command line - DONE
-        // * show total run time - DONE
-        // * deal with cwd - DONE
-        // * deal with shell - DONE
-        // * change commands at runtime <--- CONTINUE HERE (25/07)
-
-
-        // mock data
-        let commands_to_run = vec![
-            Command::new("curl https://get.volta.sh | bash"),
-            Command::new("volta install pnpm"),
-            Command::new("pnpm install"),
-            Command::new("docker-compose up -d"),
-        ];
         self.commands_to_run = commands_to_run;
         self.running_command_index = None;
         set_timeout(1.0);
@@ -118,6 +107,15 @@ impl ZellijPlugin for State {
     fn update(&mut self, event: Event) -> bool {
         let mut should_render = false;
         match event {
+            Event::PaneUpdate(panes) => {
+                for (_tab, panes) in panes.panes {
+                    for pane in panes {
+                        if self.panes_to_run_on_completion.contains_key(&pane.title) {
+                            self.panes_to_run_on_completion.get_mut(&pane.title).map(|p| *p = Some(PaneId::Terminal(pane.id)));
+                        }
+                    }
+                }
+            }
             Event::Timer(_elapsed) => {
                 set_timeout(1.0);
                 should_render = true;
@@ -149,7 +147,6 @@ impl ZellijPlugin for State {
                 }
             }
             Event::CommandPaneExited(terminal_pane_id, exit_code, context) => {
-                eprintln!("CommandPaneExited: {:?} -> {:?}, {:?}", terminal_pane_id, exit_code, context);
 
                 let command_index = context.get("command_index").and_then(|i| i.parse::<usize>().ok());
                 let current_run_index = context.get("current_run_index").and_then(|i| i.parse::<usize>().ok());
@@ -161,7 +158,8 @@ impl ZellijPlugin for State {
                                 command.exited = true;
                                 command.end_time = Some(Instant::now());
                                 if let Some(pane_id) = command.pane_id {
-                                    hide_pane_with_id(pane_id);
+                                    // TODO: toggle this
+                                    // hide_pane_with_id(pane_id);
                                 }
                                 if self.running_command_index == Some(command_index) {
                                     self.run_next_command();
@@ -241,19 +239,6 @@ impl ZellijPlugin for State {
     }
 
     fn render(&mut self, rows: usize, cols: usize) {
-        let title = "Waiting to run 4 commands...";
-        let title = "Running 1/4 commands (Success: 0, Failure: 0)";
-        let title = "Stopped (Success: 0, Failure: 0, Did not run: 2)";
-        let title = "Finished (Success: 0, Failure: 0)";
-
-        let title        = "Running 1/4 commands (Success: 0, Failure: 0)";
-
-        let list_item_1 = " > curl https://get.volta.sh | bash (Running...)";
-        let list_item_1 = "   - Running for: 1.5s";
-        let list_item_1 = "   - <ENTER> Open terminal";
-        let list_item_2 = " > volta install pnpm";
-        let list_item_3 = " > pnpm install";
-        let list_item_4 = " > docker-compose up -d";
 
         let title = self.render_title(rows, cols);
         let mut list = vec![];
@@ -406,6 +391,22 @@ impl State {
             },
             None => {
                 self.running_command_index = None;
+                if self.all_commands_exited_successfully() {
+                    for (_name, pane_id) in &self.panes_to_run_on_completion {
+                        match pane_id {
+                            Some(PaneId::Terminal(terminal_pane_id)) => {
+                                rerun_command_pane(*terminal_pane_id);
+                            }
+                            _ => {}
+                        }
+                    }
+                    for command in &self.commands_to_run {
+                        if let Some(PaneId::Terminal(pane_id)) = command.pane_id {
+                            close_terminal_pane(pane_id);
+                        }
+                    }
+                    close_self();
+                }
             }
         }
     }
@@ -415,7 +416,14 @@ impl State {
         command_line.push(&command.command_line);
         let mut command_to_run = CommandToRun::new_with_args(shell, command_line);
         command_to_run.cwd = Some(PathBuf::from(folder));
-        open_command_pane_background(command_to_run, context);
+        // open_command_pane_background(command_to_run, context);
+        let mut coordinates = FloatingPaneCoordinates::new(
+            Some("50%".to_owned()),
+            None,
+            None,
+            None,
+        );
+        open_command_pane_floating(command_to_run, None , context);
         // open_command_pane_background(CommandToRun::new_with_args("bash", command_line), context);
     }
     fn render_title(&self, rows: usize, cols: usize) -> Text {
@@ -452,6 +460,9 @@ impl State {
     }
     fn all_commands_exited(&self) -> bool {
         self.commands_to_run.iter().all(|c| c.exited || c.pane_closed_by_user)
+    }
+    fn all_commands_exited_successfully(&self) -> bool {
+        self.commands_to_run.iter().all(|c| c.exit_status == Some(0))
     }
     fn successful_command_count(&self) -> usize {
         self.commands_to_run.iter().filter(|c| c.exit_status == Some(0)).count()

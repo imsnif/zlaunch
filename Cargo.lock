@@ -3769,7 +3769,7 @@ dependencies = [
 [[package]]
 name = "zellij-tile"
 version = "0.41.0"
-source = "git+https://github.com/zellij-org/zellij#47caeb66a6c5b8b229c1227ce823defcdccf31b8"
+source = "git+https://github.com/zellij-org/zellij#affbd9237ec3f705d44e9a33236572e241209748"
 dependencies = [
  "clap",
  "serde",
@@ -3782,7 +3782,7 @@ dependencies = [
 [[package]]
 name = "zellij-utils"
 version = "0.41.0"
-source = "git+https://github.com/zellij-org/zellij#47caeb66a6c5b8b229c1227ce823defcdccf31b8"
+source = "git+https://github.com/zellij-org/zellij#affbd9237ec3f705d44e9a33236572e241209748"
 dependencies = [
  "anyhow",
  "async-channel",
