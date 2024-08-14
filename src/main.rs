@@ -57,12 +57,17 @@ impl Command {
 impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
         self.userspace_configuration = configuration;
-        request_permission(&[PermissionType::ReadApplicationState, PermissionType::ChangeApplicationState, PermissionType::RunCommands, PermissionType::OpenFiles]);
+        request_permission(&[
+            PermissionType::ReadApplicationState,
+            PermissionType::ChangeApplicationState,
+            PermissionType::RunCommands,
+            PermissionType::OpenFiles
+        ]);
         subscribe(&[
-            EventType::RunCommandResult,
             EventType::PermissionRequestResult,
             EventType::CommandPaneOpened,
             EventType::CommandPaneExited,
+            EventType::CommandPaneReRun,
             EventType::EditPaneOpened,
             EventType::EditPaneExited,
             EventType::Key,
@@ -70,51 +75,16 @@ impl ZellijPlugin for State {
             EventType::PaneClosed,
             EventType::PaneUpdate,
         ]);
-
-        let mut commands_to_run = vec![];
-        if let Some(commands) = self.userspace_configuration.get("commands") {
-            if let Ok(doc) = commands.parse::<KdlDocument>() {
-                // commands are in kdl format
-                for node in doc.nodes() {
-                    commands_to_run.push(Command::new(node.name().value().trim()));
-                }
-            } else {
-                for command in commands.split("&&") {
-                    commands_to_run.push(Command::new(command.trim()));
-                }
-            }
-        }
-        if let Some(commands) = self.userspace_configuration.get("panes_to_run_on_completion") {
-            if let Ok(doc) = commands.parse::<KdlDocument>() {
-                // these are in kdl format
-                for node in doc.nodes() {
-                    self.panes_to_run_on_completion.insert(node.name().value().trim().to_owned(), None);
-                }
-            }
-        }
-
-        self.shell = self.userspace_configuration.get("shell").map(|s| s.to_string()).unwrap_or_else(|| "bash".to_string());
-        self.folder = self.userspace_configuration.get("folder").map(|s| s.to_string()).unwrap_or_else(|| ".".to_string());
-
-        self.commands_to_run = commands_to_run;
-        self.running_command_index = None;
-        set_timeout(1.0);
+        self.parse_commands_from_configuration();
+        self.parse_panes_to_run_on_completion_from_configuration();
+        self.parse_other_configuration();
+        set_timeout(1.0); // used for indicating the elapsed time
     }
-//     fn pipe (&mut self, pipe_message: PipeMessage) -> bool {
-//         eprintln!("pipe_message: {:?}", pipe_message);
-//         true
-//     }
     fn update(&mut self, event: Event) -> bool {
         let mut should_render = false;
         match event {
             Event::PaneUpdate(panes) => {
-                for (_tab, panes) in panes.panes {
-                    for pane in panes {
-                        if self.panes_to_run_on_completion.contains_key(&pane.title) {
-                            self.panes_to_run_on_completion.get_mut(&pane.title).map(|p| *p = Some(PaneId::Terminal(pane.id)));
-                        }
-                    }
-                }
+                self.log_pane_ids_as_needed(panes);
             }
             Event::Timer(_elapsed) => {
                 set_timeout(1.0);
@@ -128,80 +98,28 @@ impl ZellijPlugin for State {
                 should_render = true;
             }
             Event::CommandPaneOpened(terminal_pane_id, context) => {
-                eprintln!("CommandPaneOpened: {:?} -> {:?}", terminal_pane_id, context);
-                let command_index = context.get("command_index").and_then(|i| i.parse::<usize>().ok());
-                let current_run_index = context.get("current_run_index").and_then(|i| i.parse::<usize>().ok());
-                match (command_index, current_run_index) {
-                    (Some(command_index), Some(current_run_index)) => {
-                        if current_run_index == self.current_run_index {
-                            if let Some(command) = self.commands_to_run.get_mut(command_index) {
-                                command.pane_id = Some(PaneId::Terminal(terminal_pane_id));
-                                command.start_time = Some(Instant::now());
-                                should_render = true;
-                            }
-                        } else {
-                            eprintln!("Received a message from a previous run, ignoring");
-                        }
-                    }
-                    _ => {}
-                }
+                should_render = self.handle_command_pane_opened(terminal_pane_id, context);
             }
-            Event::CommandPaneExited(terminal_pane_id, exit_code, context) => {
-
-                let command_index = context.get("command_index").and_then(|i| i.parse::<usize>().ok());
-                let current_run_index = context.get("current_run_index").and_then(|i| i.parse::<usize>().ok());
-                match (command_index, current_run_index) {
-                    (Some(command_index), Some(current_run_index)) => {
-                        if current_run_index == self.current_run_index {
-                            if let Some(command) = self.commands_to_run.get_mut(command_index) {
-                                command.exit_status = exit_code;
-                                command.exited = true;
-                                command.end_time = Some(Instant::now());
-                                if let Some(pane_id) = command.pane_id {
-                                    // TODO: toggle this
-                                    // hide_pane_with_id(pane_id);
-                                }
-                                if self.running_command_index == Some(command_index) {
-                                    self.run_next_command();
-                                }
-                            }
-                        } else {
-                            eprintln!("Received a message from a previous run, ignoring");
-                        }
-                    },
-                    _ => {}
-                }
+            Event::CommandPaneExited(_terminal_pane_id, exit_code, context) => {
+                self.handle_command_pane_exited(exit_code, context);
                 should_render = true;
-
+            }
+            Event::CommandPaneReRun(terminal_pane_id, context) => {
+                should_render = self.handle_command_pane_opened(terminal_pane_id, context);
             }
             Event::EditPaneOpened(terminal_pane_id, context) => {
-                eprintln!("EditPaneOpened: {:?} -> {:?}", terminal_pane_id, context);
                 if context.get("edit_pane_marker").is_some() {
                     self.active_edit_pane_ids.push(terminal_pane_id);
                 }
             }
-            Event::EditPaneExited(terminal_pane_id, exit_code, context) => {
-                eprintln!("EditPaneExited: {:?} -> {:?}, {:?}", terminal_pane_id, exit_code, context);
+            Event::EditPaneExited(terminal_pane_id, _exit_code, context) => {
                 if context.get("edit_pane_marker").is_some() {
                     self.active_edit_pane_ids.retain(|p| *p != terminal_pane_id);
                     self.handle_editor_closed();
                 }
             }
             Event::PaneClosed(pane_id) => {
-                for command in self.commands_to_run.iter_mut() {
-                    if command.pane_id == Some(pane_id) {
-                        *command = Command::new(&command.command_line);
-                        command.pane_closed_by_user = true;
-                        should_render = true;
-                        break;
-                    }
-                }
-                if let PaneId::Terminal(terminal_pane_id) = pane_id {
-                    if self.active_edit_pane_ids.contains(&terminal_pane_id) {
-                        self.active_edit_pane_ids.retain(|p| *p != terminal_pane_id);
-                        self.handle_editor_closed();
-                    }
-                }
+                should_render = self.handle_pane_closed(pane_id);
             }
             Event::Key(key) => {
                 if key.bare_key == BareKey::Down && key.has_no_modifiers() {
@@ -239,11 +157,9 @@ impl ZellijPlugin for State {
     }
 
     fn render(&mut self, rows: usize, cols: usize) {
-
         let title = self.render_title(rows, cols);
         let mut list = vec![];
         for (i, command) in self.commands_to_run.iter().enumerate() {
-            // let is_running = Some(i) == self.running_command_index;
             let is_running = command.start_time.is_some() && command.end_time.is_none();
             let is_selected = Some(i) == self.selected_index;
             list.append(&mut self.render_command(command, is_running, is_selected));
@@ -266,13 +182,12 @@ impl State {
     fn handle_editor_closed(&mut self) {
         match fs::read_to_string("/host/.editing-commands") {
             Ok(new_commands) => {
-                // TODO: also delete the file
                 self.kill_all_commands();
                 self.commands_to_run = new_commands.trim().split('\n').map(|c| Command::new(c)).collect();
-                eprintln!("commands_to_run: {:#?}", self.commands_to_run);
                 self.running_command_index = None;
                 self.current_run_index += 1;
                 self.run_next_command();
+                let _ = std::fs::remove_file("/host/.editing-commands");
             },
             Err(e) => {
                 eprintln!("Failed to read commands: {}", e);
@@ -292,11 +207,6 @@ impl State {
                 eprintln!("Failed to write commands file: {}", e);
             }
         }
-        // TODO:
-        // * dump the commands into a file - DONE
-        // * open an editor pane to that file - DONE
-        // * when the editor pane closes, parse the contents of the file into commands and replace
-        // the current ones with it
     }
     fn restart_run(&mut self) {
         self.running_command_index = None;
@@ -319,10 +229,6 @@ impl State {
             .color_range(1, 9..10 + total_run_time.chars().count())
             .color_range(1, 18 + total_run_time.chars().count()..19 + total_run_time.chars().count() + shell_text.chars().count())
             .color_range(1, 26 + total_run_time.chars().count() + shell_text.chars().count()..27 + total_run_time.chars().count() + shell_text.chars().count() + folder_text.chars().count());
-//         let text = Text::new(text)
-//             .color_range(1, ..8)
-//             .color_range(1, 11 + total_run_time.chars().count()..17 + total_run_time.chars().count())
-//             .color_range(1, 23 + total_run_time.chars().count()..23 + total_run_time.chars().count() + shell_text.chars().count());
         print_text_with_coordinates(text, 1, y_coords, None, None);
     }
     fn total_run_time(&self) -> String {
@@ -378,6 +284,7 @@ impl State {
             return;
         }
         if self.current_command_failed() && self.stop_on_failure {
+            self.show_failed_commands();
             return;
         }
         let next_index = self.running_command_index.map(|i| i + 1).unwrap_or(0);
@@ -392,39 +299,21 @@ impl State {
             None => {
                 self.running_command_index = None;
                 if self.all_commands_exited_successfully() {
-                    for (_name, pane_id) in &self.panes_to_run_on_completion {
-                        match pane_id {
-                            Some(PaneId::Terminal(terminal_pane_id)) => {
-                                rerun_command_pane(*terminal_pane_id);
-                            }
-                            _ => {}
-                        }
-                    }
-                    for command in &self.commands_to_run {
-                        if let Some(PaneId::Terminal(pane_id)) = command.pane_id {
-                            close_terminal_pane(pane_id);
-                        }
-                    }
-                    close_self();
+                    self.handle_run_end();
+                } else {
+                    // TODO: CONTINUE HERE - if the user fixed the exited command, we should
+                    // continue the run
+                    self.show_failed_commands();
                 }
             }
         }
     }
     fn run_command(command: &Command, context: BTreeMap<String, String>, shell: &str, folder: &str) {
-        // TODO: dear gods no
         let mut command_line = vec![ "-ic" ];
         command_line.push(&command.command_line);
         let mut command_to_run = CommandToRun::new_with_args(shell, command_line);
         command_to_run.cwd = Some(PathBuf::from(folder));
-        // open_command_pane_background(command_to_run, context);
-        let mut coordinates = FloatingPaneCoordinates::new(
-            Some("50%".to_owned()),
-            None,
-            None,
-            None,
-        );
         open_command_pane_floating(command_to_run, None , context);
-        // open_command_pane_background(CommandToRun::new_with_args("bash", command_line), context);
     }
     fn render_title(&self, rows: usize, cols: usize) -> Text {
         let successful_commands = self.successful_command_count();
@@ -580,6 +469,139 @@ impl State {
                 self.commands_to_run.get_mut(selected_index)
             },
             None => None
+        }
+    }
+    fn parse_commands_from_configuration(&mut self) {
+        if let Some(commands) = self.userspace_configuration.get("commands") {
+            if let Ok(doc) = commands.parse::<KdlDocument>() {
+                // commands are in kdl format
+                for node in doc.nodes() {
+                    self.commands_to_run.push(Command::new(node.name().value().trim()));
+                }
+            } else {
+                for command in commands.split("&&") {
+                    self.commands_to_run.push(Command::new(command.trim()));
+                }
+            }
+        }
+    }
+    fn parse_panes_to_run_on_completion_from_configuration(&mut self) {
+        if let Some(commands) = self.userspace_configuration.get("panes_to_run_on_completion") {
+            if let Ok(doc) = commands.parse::<KdlDocument>() {
+                // these are in kdl format
+                for node in doc.nodes() {
+                    self.panes_to_run_on_completion.insert(node.name().value().trim().to_owned(), None);
+                }
+            }
+        }
+    }
+    fn parse_other_configuration(&mut self) {
+        self.shell = self.userspace_configuration.get("shell").map(|s| s.to_string()).unwrap_or_else(|| "bash".to_string());
+        self.folder = self.userspace_configuration.get("folder").map(|s| s.to_string()).unwrap_or_else(|| ".".to_string());
+        self.stop_on_failure = self.userspace_configuration.get("stop_on_failure").map(|s| s == "true").unwrap_or(false);
+    }
+    fn log_pane_ids_as_needed(&mut self, panes: PaneManifest) {
+        for (_tab, panes) in panes.panes {
+            for pane in panes {
+                if self.panes_to_run_on_completion.contains_key(&pane.title) {
+                    self.panes_to_run_on_completion.get_mut(&pane.title).map(|p| *p = Some(PaneId::Terminal(pane.id)));
+                }
+            }
+        }
+    }
+    fn handle_command_pane_opened(&mut self, terminal_pane_id: u32, context: BTreeMap<String, String>) -> bool {
+        let mut should_render = false;
+        let command_index = context.get("command_index").and_then(|i| i.parse::<usize>().ok());
+        let current_run_index = context.get("current_run_index").and_then(|i| i.parse::<usize>().ok());
+        match (command_index, current_run_index) {
+            (Some(command_index), Some(current_run_index)) => {
+                if current_run_index == self.current_run_index {
+                    if let Some(command) = self.commands_to_run.get_mut(command_index) {
+                        command.pane_id = Some(PaneId::Terminal(terminal_pane_id));
+                        command.start_time = Some(Instant::now());
+                        command.end_time = None; // in case this is a re-run
+                        should_render = true;
+                    }
+                } else {
+                    eprintln!("Received a message from a previous run, ignoring");
+                }
+            }
+            _ => {}
+        }
+        should_render
+    }
+    fn handle_command_pane_exited(&mut self, exit_code: Option<i32>, context: BTreeMap<String, String>) {
+        let command_index = context.get("command_index").and_then(|i| i.parse::<usize>().ok());
+        let current_run_index = context.get("current_run_index").and_then(|i| i.parse::<usize>().ok());
+        match (command_index, current_run_index) {
+            (Some(command_index), Some(current_run_index)) => {
+                if current_run_index == self.current_run_index {
+                    if let Some(command) = self.commands_to_run.get_mut(command_index) {
+                        command.exit_status = exit_code;
+                        command.exited = true;
+                        command.end_time = Some(Instant::now());
+                        if let Some(_pane_id) = command.pane_id {
+                            // TODO: toggle this
+                            // hide_pane_with_id(pane_id);
+                        }
+                        if self.running_command_index == Some(command_index) {
+                            self.run_next_command();
+                        } else if self.all_commands_exited_successfully() {
+                            self.handle_run_end();
+                        }
+                    }
+                } else {
+                    eprintln!("Received a message from a previous run, ignoring");
+                }
+            },
+            _ => {}
+        }
+    }
+    fn handle_pane_closed(&mut self, pane_id: PaneId) -> bool {
+        let mut should_render = false;
+        for command in self.commands_to_run.iter_mut() {
+            if command.pane_id == Some(pane_id) {
+                *command = Command::new(&command.command_line);
+                command.pane_closed_by_user = true;
+                should_render = true;
+                break;
+            }
+        }
+        if let PaneId::Terminal(terminal_pane_id) = pane_id {
+            if self.active_edit_pane_ids.contains(&terminal_pane_id) {
+                self.active_edit_pane_ids.retain(|p| *p != terminal_pane_id);
+                self.handle_editor_closed();
+            }
+        }
+        should_render
+    }
+    fn handle_run_end(&self) {
+        for (_name, pane_id) in &self.panes_to_run_on_completion {
+            match pane_id {
+                Some(PaneId::Terminal(terminal_pane_id)) => {
+                    rerun_command_pane(*terminal_pane_id);
+                }
+                _ => {}
+            }
+        }
+        for command in &self.commands_to_run {
+            if let Some(PaneId::Terminal(pane_id)) = command.pane_id {
+                close_terminal_pane(pane_id);
+            }
+        }
+        close_self();
+    }
+    fn show_failed_commands(&self) {
+        for command in &self.commands_to_run {
+            if let Some(pane_id) = command.pane_id {
+                if let Some(exit_status) = command.exit_status {
+                    if exit_status != 0 {
+                        show_pane_with_id(pane_id, true);
+                        continue;
+                    }
+                }
+                hide_pane_with_id(pane_id);
+            }
         }
     }
 }

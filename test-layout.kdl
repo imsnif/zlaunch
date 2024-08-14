@@ -1,18 +1,73 @@
-layout {
+layout title="zellij-dev" cwd="/home/aram/code/layout-manager" {
+  default_tab_template {
     pane size=1 borderless=true {
-        plugin location="zellij:tab-bar"
+      plugin location="zellij:tab-bar"
     }
-    pane {
-        plugin location="file:/home/aram/code/rust-plugin-example/target/wasm32-wasi/debug/rust-plugin-example.wasm" {
-            commands {
-                "curl https://get.volta.sh | bash";
-                "volta install pnpm";
-                "pnpm install";
-                "docker-compose up -d";
-            }
-        }
-    }
+    children
     pane size=1 borderless=true {
         plugin location="zellij:status-bar"
     }
+  }
+
+  tab name="layout-manager" {
+    pane split_direction="vertical" {
+      pane edit="src/main.rs"
+      pane stacked=true {
+          pane command="bash" name="Build and reload plugin" {
+              args "-ic" "cargo build && zellij action start-or-reload-plugin file:target/wasm32-wasi/debug/layout-manager.wasm --configuration server_url=\"http://localhost:3000/api/layouts\""
+              start_suspended true
+          }
+      }
+    }
+  }
+
+  tab name="layout-server" cwd="../layout-server" {
+    floating_panes {
+        pane name="Setting up environment..." {
+            x "0%";
+            y "0%";
+            width "100%";
+            height "100%";
+            // plugin location="https://github.com/imsnif/zlaunch/releases/download/v0.2.0/zlaunch.wasm" {
+            plugin location="file:/home/aram/code/zlaunch/target/wasm32-wasi/debug/zlaunch.wasm" {
+                stop_on_failure true
+                commands {
+                    "curl https://get.volta.sh | bash";
+                    "/tmp/i-error && volta install pnpm";
+                    "pnpm install";
+                    "docker-compose up -d";
+                }
+                panes_to_run_on_completion {
+                    "Start Server"
+                }
+            }
+        }
+    }
+    pane split_direction="vertical" {
+      pane command="pnpm" name="Start Server" {
+        args "dev"
+        start_suspended true
+      }
+      pane split_direction="horizontal" stacked=true {
+        pane command="pnpm" name="Typecheck" {
+          args "--filter" "backend" "typecheck"
+          start_suspended true
+        }
+        pane command="pnpm" name="Lint" {
+          args "--filter" "backend" "lint"
+          start_suspended true
+        }
+        // pane command="pnpm" name="Firebase Auth Emulator" {
+        //   args "--filter" "backend" "emulator:start"
+        //   cwd "../layout-server"
+        //   start_suspended true
+        // }
+        pane command="scripts/create-user.sh" name="Auth Tokens" {
+          args ""
+          start_suspended true
+        }
+        pane expanded=true;
+      }
+    }
+  }
 }
